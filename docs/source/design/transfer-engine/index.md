@@ -49,6 +49,10 @@ With the help of Transfer Engine, Mooncake Store can achieve local DRAM/VRAM rea
 
 The BatchTransfer API uses an array of requests, which specify the operation type (READ or WRITE), data length, and local and remote memory addresses. The transfer operation is applicable to DRAM and GPU VRAM. The completion of these operations can be asynchronously monitored through the `getTransferStatus` API.
 
+The experimental Python [managed batch tickets](managed-batch-tickets.md) add
+bounded admission, single-query progress and conservative ownership retention
+for PD state transfers.
+
 ### Topology Aware Path Selection
 Modern inference servers often consist of multiple CPU sockets, DRAM, GPUs, and RDMA NIC devices. Although it's technically possible to transfer data from local DRAM or VRAM to a remote location using any RDMA NIC, these transfers can be limited by the bandwidth constraints of the Ultra Path Interconnect (UPI) or PCIe Switch. To overcome these limitations, Transfer Engine implements a topology-aware path selection algorithm.
 

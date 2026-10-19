@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "common/base/status.h"
+#include "managed_batch_ticket.h"
 #include "transfer_engine.h"
 #include "transfer_engine_c.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -163,6 +164,26 @@ class TransferEnginePy {
 
     int getBatchTransferStatus(const std::vector<batch_id_t> &batch_ids);
 
+    std::shared_ptr<ManagedBatchTicket> batchTransferAsyncReadTicket(
+        const char *target_hostname, const std::vector<uintptr_t> &buffers,
+        const std::vector<uintptr_t> &peer_buffer_addresses,
+        const std::vector<size_t> &lengths,
+        const std::string &transport_hint = "",
+        const std::string &nic_hint = "");
+
+    std::shared_ptr<ManagedBatchTicket> batchTransferAsyncWriteTicket(
+        const char *target_hostname, const std::vector<uintptr_t> &buffers,
+        const std::vector<uintptr_t> &peer_buffer_addresses,
+        const std::vector<size_t> &lengths,
+        const std::string &transport_hint = "",
+        const std::string &nic_hint = "");
+
+    void setManagedBatchLimit(size_t limit) {
+        managed_batches_->setLimit(limit);
+    }
+
+    size_t managedBatchCount() const { return managed_batches_->size(); }
+
 #ifdef USE_CUDA
     void batchTransferOnCuda(
         const char *target_hostname, const std::vector<uintptr_t> &buffers,
@@ -243,6 +264,12 @@ class TransferEnginePy {
     uintptr_t getEnginePtr() const { return (uintptr_t)engine_.get(); }
 
    private:
+    std::shared_ptr<ManagedBatchTicket> batchTransferAsyncTicket(
+        const char *target_hostname, const std::vector<uintptr_t> &buffers,
+        const std::vector<uintptr_t> &peer_buffer_addresses,
+        const std::vector<size_t> &lengths, TransferOpcode opcode,
+        const std::string &transport_hint, const std::string &nic_hint);
+
     std::shared_ptr<ScatterTransferTicket> scatterTransferSyncWithTicket(
         const std::string &endpoint,
         const std::vector<uintptr_t> &local_base_addresses,
@@ -273,4 +300,6 @@ class TransferEnginePy {
     bool auto_discovery_;
 
     uint64_t transfer_timeout_nsec_;
+    std::shared_ptr<ManagedBatchPool> managed_batches_ =
+        std::make_shared<ManagedBatchPool>();
 };

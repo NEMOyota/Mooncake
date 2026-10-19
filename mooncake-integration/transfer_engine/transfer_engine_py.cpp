@@ -231,6 +231,15 @@ TransferEnginePy::TransferEnginePy() {
 }
 
 TransferEnginePy::~TransferEnginePy() {
+    if (managed_batches_->size() != 0) {
+        // Unfinished tickets retain their engine and request vectors through
+        // the bounded pool. Managed allocations must follow the same lifetime.
+        // Raw external addresses remain the caller's responsibility.
+        LOG(ERROR) << "Retaining engine resources for "
+                   << managed_batches_->size()
+                   << " pending/quarantined managed batches";
+        return;
+    }
     for (auto& handle : handle_map_) engine_->closeSegment(handle.second);
     handle_map_.clear();
     engine_.reset();
@@ -298,6 +307,10 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                                     const char* protocol,
                                     const char* device_name,
                                     const char* metadata_type) {
+    if (managed_batches_->size() != 0) {
+        LOG(ERROR) << "Cannot reinitialize an engine with managed transfers";
+        return -1;
+    }
     if (protocol != nullptr && strcmp(protocol, "xgmi") == 0) {
         LOG(ERROR) << "Protocol 'xgmi' is not exposed in the Python API. "
                    << "Use 'hip' instead.";
@@ -943,6 +956,158 @@ int TransferEnginePy::batchTransferSync(
     return -1;
 }
 
+std::shared_ptr<ManagedBatchTicket>
+TransferEnginePy::batchTransferAsyncReadTicket(
+    const char* target_hostname, const std::vector<uintptr_t>& buffers,
+    const std::vector<uintptr_t>& peer_buffer_addresses,
+    const std::vector<size_t>& lengths, const std::string& transport_hint,
+    const std::string& nic_hint) {
+    return batchTransferAsyncTicket(
+        target_hostname, buffers, peer_buffer_addresses, lengths,
+        TransferOpcode::READ, transport_hint, nic_hint);
+}
+
+std::shared_ptr<ManagedBatchTicket>
+TransferEnginePy::batchTransferAsyncWriteTicket(
+    const char* target_hostname, const std::vector<uintptr_t>& buffers,
+    const std::vector<uintptr_t>& peer_buffer_addresses,
+    const std::vector<size_t>& lengths, const std::string& transport_hint,
+    const std::string& nic_hint) {
+    return batchTransferAsyncTicket(
+        target_hostname, buffers, peer_buffer_addresses, lengths,
+        TransferOpcode::WRITE, transport_hint, nic_hint);
+}
+
+std::shared_ptr<ManagedBatchTicket> TransferEnginePy::batchTransferAsyncTicket(
+    const char* target_hostname, const std::vector<uintptr_t>& buffers,
+    const std::vector<uintptr_t>& peer_buffer_addresses,
+    const std::vector<size_t>& lengths, TransferOpcode opcode,
+    const std::string& transport_hint, const std::string& nic_hint) {
+    pybind11::gil_scoped_release release;
+    if (!engine_ || !target_hostname || target_hostname[0] == '\0') {
+        throw std::invalid_argument("initialized engine and peer are required");
+    }
+    if (buffers.empty() || buffers.size() != peer_buffer_addresses.size() ||
+        buffers.size() != lengths.size()) {
+        throw std::invalid_argument("nonempty address/length lists must match");
+    }
+    size_t expected_bytes = 0;
+    for (size_t i = 0; i < lengths.size(); ++i) {
+        if (lengths[i] == 0 || buffers[i] == 0 ||
+            peer_buffer_addresses[i] == 0 ||
+            lengths[i] > std::numeric_limits<uintptr_t>::max() - buffers[i] ||
+            lengths[i] > std::numeric_limits<uintptr_t>::max() -
+                             peer_buffer_addresses[i]) {
+            throw std::invalid_argument(
+                "invalid or overflowing transfer range");
+        }
+        if (lengths[i] > std::numeric_limits<size_t>::max() - expected_bytes) {
+            throw std::invalid_argument("managed batch byte count overflows");
+        }
+        expected_bytes += lengths[i];
+    }
+
+    struct BatchOwner {
+        // Classic TransferTask points into this vector. Declare engine after
+        // entries so engine teardown, if any, precedes descriptor destruction.
+        std::vector<TransferRequest> entries;
+        std::shared_ptr<TransferEngine> engine;
+        BatchID batch = INVALID_BATCH_ID;
+        size_t expected_bytes = 0;
+    };
+    auto owner = std::make_shared<BatchOwner>();
+    owner->engine = engine_;
+    owner->expected_bytes = expected_bytes;
+    auto ticket = managed_batches_->create([owner]() -> ManagedBatchResult {
+        TransferStatus status{};
+        auto query =
+            owner->engine->getBatchTransferStatus(owner->batch, status);
+        if (!query.ok()) {
+            return {ManagedBatchState::FAILED_UNDRAINED, query.ToString()};
+        }
+        if (status.s == TransferStatusEnum::COMPLETED) {
+            if (status.transferred_bytes != owner->expected_bytes) {
+                return {
+                    ManagedBatchState::FAILED_UNDRAINED,
+                    "completed batch byte count differs from submitted ranges"};
+            }
+            // No pointer cast or backend-specific batch layout. A deferred
+            // classic cleanup may still access descriptors, so quarantine it.
+            auto cleanup = owner->engine->freeBatchID(owner->batch);
+            if (!cleanup.ok()) {
+                return {ManagedBatchState::FAILED_UNDRAINED,
+                        "completed transfer cleanup: " + cleanup.ToString()};
+            }
+            owner->batch = INVALID_BATCH_ID;
+            return {ManagedBatchState::COMPLETED, ""};
+        }
+        if (status.s == TransferStatusEnum::WAITING ||
+            status.s == TransferStatusEnum::PENDING) {
+            return {ManagedBatchState::WAITING, ""};
+        }
+        return {ManagedBatchState::FAILED_UNDRAINED,
+                "transport reported terminal status " +
+                    std::to_string(static_cast<int>(status.s))};
+    });
+
+    // Admission precedes peer lookup and publication. All failures below this
+    // flag can safely return the slot; after submit, partial publication must
+    // be assumed even when the API reports an error.
+    bool submitted = false;
+    try {
+        Transport::SegmentHandle handle;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            auto found = handle_map_.find(target_hostname);
+            if (found != handle_map_.end()) {
+                handle = found->second;
+            } else {
+                handle = engine_->openSegment(target_hostname);
+                if (handle == static_cast<Transport::SegmentHandle>(-1)) {
+                    throw std::runtime_error("failed to open transfer peer");
+                }
+                handle_map_[target_hostname] = handle;
+            }
+        }
+        const int nic_hint_id = resolveNicHint(nic_hint);
+        const auto hint = parseTransportHint(transport_hint);
+        owner->entries.reserve(buffers.size());
+        for (size_t i = 0; i < buffers.size(); ++i) {
+            TransferRequest entry{};
+            entry.opcode = opcode == TransferOpcode::READ
+                               ? TransferRequest::READ
+                               : TransferRequest::WRITE;
+            entry.source = reinterpret_cast<void*>(buffers[i]);
+            entry.target_id = handle;
+            entry.target_offset = peer_buffer_addresses[i];
+            entry.length = lengths[i];
+            entry.transport_hint = hint;
+            entry.nic_hint = nic_hint_id;
+            owner->entries.push_back(entry);
+        }
+        owner->batch = engine_->allocateBatchID(owner->entries.size());
+        if (owner->batch == 0 || owner->batch == INVALID_BATCH_ID) {
+            throw std::runtime_error("failed to allocate transfer batch");
+        }
+        submitted = true;
+        auto result = engine_->submitTransfer(owner->batch, owner->entries);
+        if (!result.ok()) ticket->fail("submit: " + result.ToString());
+    } catch (const std::exception& exc) {
+        if (!submitted) {
+            ticket->rejectBeforeSubmit(exc.what());
+            throw;
+        }
+        ticket->fail(std::string("submit exception: ") + exc.what());
+    } catch (...) {
+        if (!submitted) {
+            ticket->rejectBeforeSubmit("exception before transfer submit");
+            throw;
+        }
+        ticket->fail("unknown exception during transfer submit");
+    }
+    return ticket;
+}
+
 batch_id_t TransferEnginePy::batchTransferAsync(
     const char* target_hostname, const std::vector<uintptr_t>& buffers,
     const std::vector<uintptr_t>& peer_buffer_addresses,
@@ -1554,6 +1719,15 @@ PYBIND11_MODULE(engine, m) {
             return ticket.drain(timeout_ms);
         });
 
+    py::class_<ManagedBatchTicket, std::shared_ptr<ManagedBatchTicket>>(
+        m, "ManagedBatchTicket")
+        .def("poll",
+             [](ManagedBatchTicket& ticket) {
+                 py::gil_scoped_release release;
+                 return std::string(managedBatchStateName(ticket.poll().state));
+             })
+        .def_property_readonly("error", &ManagedBatchTicket::error);
+
     py::class_<TransferEnginePy::TransferNotify>(m, "TransferNotify")
         .def(py::init<>())
         .def(py::init<const std::string&, const std::string&>(),
@@ -1612,6 +1786,23 @@ PYBIND11_MODULE(engine, m) {
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
                  py::arg("transport_hint") = "", py::arg("nic_hint") = "")
+            .def("batch_transfer_async_write_ticket",
+                 &TransferEnginePy::batchTransferAsyncWriteTicket,
+                 py::arg("target_hostname"), py::arg("buffers"),
+                 py::arg("peer_buffer_addresses"), py::arg("lengths"),
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "",
+                 py::keep_alive<0, 1>())
+            .def("batch_transfer_async_read_ticket",
+                 &TransferEnginePy::batchTransferAsyncReadTicket,
+                 py::arg("target_hostname"), py::arg("buffers"),
+                 py::arg("peer_buffer_addresses"), py::arg("lengths"),
+                 py::arg("transport_hint") = "", py::arg("nic_hint") = "",
+                 py::keep_alive<0, 1>())
+            .def("set_managed_batch_limit",
+                 &TransferEnginePy::setManagedBatchLimit,
+                 py::arg("max_batches"))
+            .def_property_readonly("managed_batch_count",
+                                   &TransferEnginePy::managedBatchCount)
             .def("transfer_sync", &TransferEnginePy::transferSync,
                  py::arg("target_hostname"), py::arg("buffer"),
                  py::arg("peer_buffer_address"), py::arg("length"),
